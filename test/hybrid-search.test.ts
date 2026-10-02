@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import type { CompressedObservation, EmbeddingProvider } from "../src/types.js";
@@ -179,5 +179,19 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("mem_abc");
     expect(results[0].observation.narrative).toBe("Test memory for search");
     expect(results[0].observation.concepts).toEqual(["test", "search"]);
+  });
+  it("skips graph retrieval entirely when graph weight is zero", async () => {
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    bm25.add(obs);
+    await kv.set("mem:obs:ses_1", "obs_1", obs);
+    const list = vi.spyOn(kv, "list");
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never, 0.4, 0.6, 0);
+    const results = await hybrid.search("auth");
+
+    expect(results.length).toBe(1);
+    expect(
+      list.mock.calls.filter(([scope]) => String(scope).startsWith("mem:graph:")),
+    ).toHaveLength(0);
   });
 });

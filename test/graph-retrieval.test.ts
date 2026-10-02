@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
 import type { GraphNode, GraphEdge } from "../src/types.js";
 
@@ -294,5 +294,49 @@ describe("GraphRetrieval", () => {
     const results = await retrieval.searchByEntities(["Start"], 2);
     expect(results.find((r) => r.obsId === "obs_3")).toBeDefined();
     expect(results.find((r) => r.obsId === "obs_4")).toBeUndefined();
+  });
+  it("shares one graph load across concurrent searches", async () => {
+    const nodes = [makeNode("n1", "React", "library", ["obs_1"])];
+    const kv = mockKV(nodes, []);
+    const list = vi.spyOn(kv, "list");
+    const retrieval = new GraphRetrieval(kv as never);
+
+    await Promise.all([
+      retrieval.searchByEntities(["React"]),
+      retrieval.searchByEntities(["React"]),
+      retrieval.expandFromChunks(["obs_1"]),
+    ]);
+    await retrieval.searchByEntities(["React"]);
+
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("reloads the graph once the cache TTL has expired", async () => {
+    const kv = mockKV([makeNode("n1", "React", "library", ["obs_1"])], []);
+    const retrieval = new GraphRetrieval(kv as never, 0);
+
+    expect(await retrieval.searchByEntities(["Vue"])).toHaveLength(0);
+    await kv.set("mem:graph:nodes", "n2", makeNode("n2", "Vue", "library", ["obs_2"]));
+    const results = await retrieval.searchByEntities(["Vue"]);
+
+    expect(results.map((r) => r.obsId)).toContain("obs_2");
+  });
+
+  it("does not cache a failed graph load", async () => {
+    const kv = mockKV([makeNode("n1", "React", "library", ["obs_1"])], []);
+    const list = kv.list;
+    let failNext = true;
+    kv.list = (async <T>(scope: string): Promise<T[]> => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("engine busy");
+      }
+      return list<T>(scope);
+    }) as typeof kv.list;
+    const retrieval = new GraphRetrieval(kv as never);
+
+    await expect(retrieval.searchByEntities(["React"])).rejects.toThrow("engine busy");
+    const results = await retrieval.searchByEntities(["React"]);
+    expect(results.map((r) => r.obsId)).toContain("obs_1");
   });
 });

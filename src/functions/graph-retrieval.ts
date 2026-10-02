@@ -38,16 +38,51 @@ function buildGraphContext(
   return parts.join(" ");
 }
 
+const DEFAULT_GRAPH_CACHE_TTL_MS = 30_000;
+
+type GraphData = { nodes: GraphNode[]; edges: GraphEdge[] };
+
 export class GraphRetrieval {
-  constructor(private kv: StateKV) {}
+  private cached: { data: GraphData; loadedAt: number } | null = null;
+  private loading: Promise<GraphData> | null = null;
+
+  constructor(
+    private kv: StateKV,
+    private cacheTtlMs = DEFAULT_GRAPH_CACHE_TTL_MS,
+  ) {}
+
+  // Every smart-search (one per tool call from the pre-tool-use hook) walks
+  // the graph, and kv.list returns the whole scope: 100+ MB of nodes and
+  // edges on a mature corpus. Concurrent searches made the engine build that
+  // payload many times at once and OOM. Share one in-flight load and reuse
+  // it for a short TTL; slightly stale graph context is fine for ranking.
+  private async loadGraph(): Promise<GraphData> {
+    if (this.cached && Date.now() - this.cached.loadedAt < this.cacheTtlMs) {
+      return this.cached.data;
+    }
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
+      const nodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter(
+        (n) => !n.stale,
+      );
+      const edges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
+        (e) => !e.stale,
+      );
+      const data = { nodes, edges };
+      this.cached = { data, loadedAt: Date.now() };
+      return data;
+    })().finally(() => {
+      this.loading = null;
+    });
+    return this.loading;
+  }
 
   async searchByEntities(
     entityNames: string[],
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraph();
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -119,8 +154,7 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraph();
 
     const linkedNodes = allNodes.filter((n) =>
       n.sourceObservationIds.some((id) => obsIds.includes(id)),
