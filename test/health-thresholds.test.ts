@@ -94,4 +94,33 @@ describe("evaluateHealth memory severity", () => {
     const strict = evaluateHealth(s, { memoryRssFloorBytes: 1024 * 1024 * 1024 });
     expect(strict.status).toBe("healthy");
   });
+  it("stays healthy for a large busy heap that is far from heap_size_limit", () => {
+    const s = snap({
+      memory: {
+        heapUsed: 524 * 1024 * 1024,
+        heapTotal: 618 * 1024 * 1024,
+        heapLimit: 4144 * 1024 * 1024,
+        rss: 647 * 1024 * 1024,
+        external: 0,
+      },
+    });
+    const { status, alerts } = evaluateHealth(s);
+    expect(status).toBe("healthy");
+    expect(alerts.some((a) => a.startsWith("memory_"))).toBe(false);
+  });
+
+  it("goes critical when the heap approaches heap_size_limit", () => {
+    const s = snap({
+      memory: {
+        heapUsed: 4000 * 1024 * 1024,
+        heapTotal: 4050 * 1024 * 1024,
+        heapLimit: 4144 * 1024 * 1024,
+        rss: 4300 * 1024 * 1024,
+        external: 0,
+      },
+    });
+    const { status, alerts } = evaluateHealth(s);
+    expect(status).toBe("critical");
+    expect(alerts.some((a) => a.startsWith("memory_critical_"))).toBe(true);
+  });
 });

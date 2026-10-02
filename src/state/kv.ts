@@ -44,4 +44,12 @@ export class StateKV {
       payload: { scope },
     })
   }
+
+  async listGroups(): Promise<string[]> {
+    const result = await this.sdk.trigger<Record<string, never>, { groups?: string[] } | null>({
+      function_id: 'state::list_groups',
+      payload: {},
+    })
+    return Array.isArray(result?.groups) ? result.groups : []
+  }
 }

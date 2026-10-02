@@ -42,6 +42,13 @@ function createIndexGeneration(): string {
   return generateId("idx");
 }
 
+function generationTimestamp(generation: string): number | null {
+  const match = /^idx_([0-9a-z]+)_[0-9a-f]+$/.exec(generation);
+  if (!match) return null;
+  const ts = parseInt(match[1]!, 36);
+  return Number.isFinite(ts) ? ts : null;
+}
+
 function statePath(scope: string, key: string): string {
   return `${scope}/${key}`;
 }
@@ -68,6 +75,9 @@ function isValidShardDescriptor(
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = 0;
+  private running: Promise<void> | null = null;
+  private queued: Promise<void> | null = null;
+  private sweptPrefixes = new Set<string>();
 
   constructor(
     private kv: StateKV,
@@ -87,11 +97,34 @@ export class IndexPersistence {
     }, DEBOUNCE_MS);
   }
 
-  async save(): Promise<void> {
+  save(): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    // Overlapping saves both read the same `previous` manifest, so only one
+    // of their generations ever gets cleaned up; the other is orphaned for
+    // good. Serialize them and coalesce everything that arrives mid-save
+    // into a single follow-up save of the latest in-memory state.
+    if (this.queued) return this.queued;
+    if (this.running) {
+      this.queued = this.running.then(() => {
+        this.queued = null;
+        return this.startSave();
+      });
+      return this.queued;
+    }
+    return this.startSave();
+  }
+
+  private startSave(): Promise<void> {
+    this.running = this.persist().finally(() => {
+      this.running = null;
+    });
+    return this.running;
+  }
+
+  private async persist(): Promise<void> {
     try {
       await this.saveBm25Index(this.bm25.serialize());
       if (this.vector) {
@@ -193,20 +226,27 @@ export class IndexPersistence {
     }
 
     const writeResults = await Promise.allSettled(
-      shards.map(async (shard, index) => {
-        const chunk = chunks[index] ?? "";
-        await this.kv.set(shard.scope, shard.key, chunk);
-        await this.auditIndexPersistence("shard_write", [
-          statePath(shard.scope, shard.key),
-        ], {
-          scope: shard.scope,
-          key: shard.key,
+      shards.map((shard, index) =>
+        this.kv.set(shard.scope, shard.key, chunks[index] ?? ""),
+      ),
+    );
+    // One audit row per batch, not per shard: a 100 MB index is ~50 shards
+    // per save, and per-shard rows grew mem:audit by tens of MB.
+    const writtenShards = shards.filter(
+      (_, index) => writeResults[index]?.status === "fulfilled",
+    );
+    if (writtenShards.length > 0) {
+      await this.auditIndexPersistence(
+        "shard_write",
+        writtenShards.map((shard) => statePath(shard.scope, shard.key)),
+        {
           manifestKey,
           generation,
-          chars: chunk.length,
-        });
-      }),
-    );
+          shards: writtenShards.length,
+          chars: writtenShards.reduce((sum, shard) => sum + shard.chars, 0),
+        },
+      );
+    }
     const failedWrite = writeResults.find(
       (result): result is PromiseRejectedResult => result.status === "rejected",
     );
@@ -259,11 +299,63 @@ export class IndexPersistence {
       const currentShardIds = new Set(
         shards.map((shard) => `${shard.scope}\0${shard.key}`),
       );
-      for (const shard of previous.shards) {
-        if (currentShardIds.has(`${shard.scope}\0${shard.key}`)) continue;
-        await this.deleteShards([shard], "previous_generation_cleanup");
+      const staleShards = previous.shards.filter(
+        (shard) => !currentShardIds.has(`${shard.scope}\0${shard.key}`),
+      );
+      await this.deleteShards(staleShards, "previous_generation_cleanup");
+    }
+    await this.sweepOrphanGenerations(scopePrefix, generation);
+  }
+
+  // Generations left behind by a crash mid-save (e.g. engine OOM) are not
+  // referenced by any manifest, so the previous-generation cleanup never
+  // sees them. They accumulate and the file-based engine keeps every one
+  // in RAM. Sweep once per process after the first successful commit.
+  private async sweepOrphanGenerations(
+    scopePrefix: string,
+    liveGeneration: string,
+  ): Promise<void> {
+    if (this.sweptPrefixes.has(scopePrefix)) return;
+    if (typeof this.kv.listGroups !== "function") return;
+    this.sweptPrefixes.add(scopePrefix);
+    let groups: string[];
+    try {
+      groups = await this.kv.listGroups();
+    } catch (err) {
+      logger.warn("index persistence: orphan sweep could not list scopes", {
+        message: errorMessage(err),
+      });
+      return;
+    }
+    const liveTs = generationTimestamp(liveGeneration);
+    const orphans = groups.filter((scope) => {
+      if (!scope.startsWith(scopePrefix)) return false;
+      const generation = scope.slice(scopePrefix.length).split(":")[0] ?? "";
+      if (generation === liveGeneration) return false;
+      // A newer generation may belong to another worker's in-flight save.
+      const ts = generationTimestamp(generation);
+      return !(liveTs !== null && ts !== null && ts > liveTs);
+    });
+    if (orphans.length === 0) return;
+    let failed = 0;
+    for (const scope of orphans) {
+      try {
+        await this.kv.delete(scope, INDEX_SHARD_KEY);
+      } catch {
+        failed++;
       }
     }
+    logger.info("index persistence: swept orphan index shards", {
+      scopePrefix,
+      swept: orphans.length - failed,
+      failed,
+    });
+    await this.auditIndexPersistence("orphan_sweep", [scopePrefix], {
+      scopePrefix,
+      liveGeneration,
+      swept: orphans.length - failed,
+      failed,
+    });
   }
 
   private async auditIndexPersistence(
@@ -306,9 +398,28 @@ export class IndexPersistence {
     shards: IndexShardManifest["shards"],
     reason: string,
   ): Promise<void> {
+    if (shards.length === 0) return;
+    const failures: Array<{ target: string; error: string }> = [];
     for (const shard of shards) {
-      await this.deleteKey(shard.scope, shard.key, reason);
+      try {
+        await this.kv.delete(shard.scope, shard.key);
+      } catch (err) {
+        failures.push({
+          target: statePath(shard.scope, shard.key),
+          error: errorMessage(err),
+        });
+      }
     }
+    await this.auditIndexPersistence(
+      "delete",
+      shards.map((shard) => statePath(shard.scope, shard.key)),
+      {
+        reason,
+        result: failures.length === 0 ? "deleted" : "failed",
+        deleted: shards.length - failures.length,
+        failures: failures.length > 0 ? failures : undefined,
+      },
+    );
   }
 
   private async isManifestPublished(

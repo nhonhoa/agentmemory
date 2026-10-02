@@ -35,6 +35,10 @@ function mockKV() {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
+    listGroups: async (): Promise<string[]> =>
+      Array.from(store.entries())
+        .filter(([, entries]) => entries.size > 0)
+        .map(([scope]) => scope),
   };
 }
 
@@ -789,5 +793,87 @@ describe("IndexPersistence", () => {
     );
 
     await expect(persistence.load()).resolves.toBeDefined();
+  });
+  it("serializes overlapping saves so no generation is orphaned", async () => {
+    vi.useRealTimers();
+    const bm25 = makeBm25("obs_1", "first");
+    let gen = 0;
+    const persistence = new IndexPersistence(kv as never, bm25, null, {
+      shardChars: 64,
+      createGeneration: () => `gen_${++gen}`,
+    });
+    await Promise.all([
+      persistence.save(),
+      persistence.save(),
+      persistence.save(),
+      persistence.save(),
+    ]);
+
+    const manifest = await getBm25Manifest(kv);
+    const shardScopes = (await kv.listGroups()).filter((scope) =>
+      scope.startsWith("mem:index:bm25:bm25:"),
+    );
+    expect(gen).toBe(2);
+    expect(shardScopes.sort()).toEqual(
+      manifest.shards.map((shard) => shard.scope).sort(),
+    );
+  });
+
+  it("sweeps orphan generations older than the live one, keeping newer ones", async () => {
+    vi.useRealTimers();
+    const now = Date.now();
+    const older = `idx_${(now - 60_000).toString(36)}_aaaaaaaaaaaa`;
+    const live = `idx_${now.toString(36)}_bbbbbbbbbbbb`;
+    const newer = `idx_${(now + 60_000).toString(36)}_cccccccccccc`;
+    await kv.set(`mem:index:bm25:bm25:${older}:00000`, "data", "stale");
+    await kv.set(`mem:index:bm25:bm25:${older}:00001`, "data", "stale");
+    await kv.set(`mem:index:bm25:bm25:${newer}:00000`, "data", "inflight");
+    await kv.set(`mem:index:bm25:vectors:${older}:00000`, "data", "other");
+
+    const bm25 = makeBm25("obs_1", "auth handler");
+    const persistence = new IndexPersistence(kv as never, bm25, null, {
+      createGeneration: () => live,
+    });
+    await persistence.save();
+
+    const groups = await kv.listGroups();
+    expect(groups.some((g) => g.includes(`bm25:${older}`))).toBe(false);
+    expect(groups).toContain(`mem:index:bm25:bm25:${newer}:00000`);
+    expect(groups).toContain(`mem:index:bm25:vectors:${older}:00000`);
+    expect(groups.some((g) => g.includes(`bm25:${live}`))).toBe(true);
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.bm25?.search("auth").length).toBeGreaterThan(0);
+  });
+  it("records one audit row per shard batch instead of one per shard", async () => {
+    vi.useRealTimers();
+    const bm25 = makeBm25("obs_1", "audit batching");
+    let gen = 0;
+    const persistence = new IndexPersistence(kv as never, bm25, null, {
+      shardChars: 64,
+      createGeneration: () => `gen_${++gen}`,
+    });
+    await persistence.save();
+    bm25.add(makeObs({ id: "obs_2", title: "second", narrative: "second" }));
+    await persistence.save();
+
+    const manifest = await getBm25Manifest(kv);
+    expect(manifest.shards.length).toBeGreaterThan(1);
+    const audits = await kv.list<{
+      targetIds: string[];
+      details: { action: string; reason?: string };
+    }>("mem:audit");
+    const writes = audits.filter((a) => a.details.action === "shard_write");
+    const cleanups = audits.filter(
+      (a) => a.details.reason === "previous_generation_cleanup",
+    );
+    expect(writes).toHaveLength(2);
+    expect(writes[1]!.targetIds).toHaveLength(manifest.shards.length);
+    expect(cleanups).toHaveLength(1);
+    expect(cleanups[0]!.targetIds.length).toBeGreaterThan(1);
   });
 });
