@@ -39,8 +39,51 @@ function buildGraphContext(
 }
 
 const DEFAULT_GRAPH_CACHE_TTL_MS = 30_000;
+const MAX_START_NODES = 25;
+const MIN_SUBSTRING_MATCH_CHARS = 3;
 
-type GraphData = { nodes: GraphNode[]; edges: GraphEdge[] };
+type Adjacency = Map<string, Array<{ neighborId: string; edge: GraphEdge }>>;
+
+type GraphData = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  nodeIndex: Map<string, GraphNode>;
+  adjacency: Adjacency;
+};
+
+function buildGraphData(nodes: GraphNode[], edges: GraphEdge[]): GraphData {
+  const nodeIndex = new Map<string, GraphNode>();
+  for (const n of nodes) nodeIndex.set(n.id, n);
+  const adjacency: Adjacency = new Map();
+  for (const edge of edges) {
+    const a = edge.sourceNodeId;
+    const b = edge.targetNodeId;
+    if (!adjacency.has(a)) adjacency.set(a, []);
+    if (!adjacency.has(b)) adjacency.set(b, []);
+    adjacency.get(a)!.push({ neighborId: b, edge });
+    adjacency.get(b)!.push({ neighborId: a, edge });
+  }
+  return { nodes, edges, nodeIndex, adjacency };
+}
+
+// Exact name matches always count. Substring matches need the shorter side
+// to be a real token: a 1-2 char node name like "id" or "ui" would
+// otherwise match almost every query and fan out into thousands of
+// traversals.
+function entityMatchRank(nameLower: string, entitiesLower: string[]): number {
+  let best = 0;
+  for (const e of entitiesLower) {
+    if (nameLower === e) return 2;
+    const shorter = Math.min(nameLower.length, e.length);
+    if (
+      shorter >= MIN_SUBSTRING_MATCH_CHARS &&
+      (nameLower.includes(e) || e.includes(nameLower))
+    ) {
+      best = 1;
+    }
+  }
+  return best;
+}
 
 export class GraphRetrieval {
   private cached: { data: GraphData; loadedAt: number } | null = null;
@@ -68,7 +111,7 @@ export class GraphRetrieval {
       const edges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
         (e) => !e.stale,
       );
-      const data = { nodes, edges };
+      const data = buildGraphData(nodes, edges);
       this.cached = { data, loadedAt: Date.now() };
       return data;
     })().finally(() => {
@@ -82,16 +125,19 @@ export class GraphRetrieval {
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const { nodes: allNodes, edges: allEdges } = await this.loadGraph();
+    const graph = await this.loadGraph();
+    const entitiesLower = entityNames.map((e) => e.toLowerCase());
 
-    const matchingNodes = allNodes.filter((n) => {
-      const nameLower = n.name.toLowerCase();
-      return entityNames.some(
-        (e) =>
-          nameLower.includes(e.toLowerCase()) ||
-          e.toLowerCase().includes(nameLower),
-      );
-    });
+    const matchingNodes = graph.nodes
+      .map((node) => ({
+        node,
+        rank: entityMatchRank(node.name.toLowerCase(), entitiesLower),
+        degree: graph.adjacency.get(node.id)?.length ?? 0,
+      }))
+      .filter((m) => m.rank > 0)
+      .sort((a, b) => b.rank - a.rank || b.degree - a.degree)
+      .slice(0, MAX_START_NODES)
+      .map((m) => m.node);
 
     if (matchingNodes.length === 0) return [];
 
@@ -99,12 +145,7 @@ export class GraphRetrieval {
     const visitedObs = new Set<string>();
 
     for (const startNode of matchingNodes) {
-      const paths = this.dijkstraTraversal(
-        startNode,
-        allNodes,
-        allEdges,
-        maxDepth,
-      );
+      const paths = this.dijkstraTraversal(startNode, graph, maxDepth);
 
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
@@ -154,17 +195,18 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    const { nodes: allNodes, edges: allEdges } = await this.loadGraph();
+    const graph = await this.loadGraph();
+    const wanted = new Set(obsIds);
 
-    const linkedNodes = allNodes.filter((n) =>
-      n.sourceObservationIds.some((id) => obsIds.includes(id)),
-    );
+    const linkedNodes = graph.nodes
+      .filter((n) => n.sourceObservationIds.some((id) => wanted.has(id)))
+      .slice(0, MAX_START_NODES);
 
     const results: GraphRetrievalResult[] = [];
     const visitedObs = new Set<string>(obsIds);
 
     for (const node of linkedNodes) {
-      const paths = this.dijkstraTraversal(node, allNodes, allEdges, maxDepth);
+      const paths = this.dijkstraTraversal(node, graph, maxDepth);
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
         for (const obsId of lastNode.sourceObservationIds) {
@@ -267,29 +309,18 @@ export class GraphRetrieval {
   // (cheaper edges = stronger relationships) returns the
   // highest-weighted path to each reachable node within maxDepth. Also
   // tightens the perf profile:
-  //   - Adjacency built once in O(V+E) (previous BFS re-filtered
-  //     allEdges per visited node, O(V·E) overall).
+  //   - Adjacency is built once per graph load in buildGraphData, not
+  //     per traversal: rebuilding it for every start node made a search
+  //     O(matches · (V+E)) and pinned the worker CPU on large graphs.
   //   - Min-heap dequeue is O(log V) per pop (previous queue.shift()
   //     was O(n) — the dominant cost on graphs above ~200 nodes per
   //     the contributor's benchmark in #328).
   private dijkstraTraversal(
     startNode: GraphNode,
-    allNodes: GraphNode[],
-    allEdges: GraphEdge[],
+    graph: GraphData,
     maxDepth: number,
   ): Array<Array<{ node: GraphNode; edge?: GraphEdge }>> {
-    const nodeIndex = new Map<string, GraphNode>();
-    for (const n of allNodes) nodeIndex.set(n.id, n);
-
-    const adjacency = new Map<string, Array<{ neighborId: string; edge: GraphEdge }>>();
-    for (const edge of allEdges) {
-      const a = edge.sourceNodeId;
-      const b = edge.targetNodeId;
-      if (!adjacency.has(a)) adjacency.set(a, []);
-      if (!adjacency.has(b)) adjacency.set(b, []);
-      adjacency.get(a)!.push({ neighborId: b, edge });
-      adjacency.get(b)!.push({ neighborId: a, edge });
-    }
+    const { nodeIndex, adjacency } = graph;
 
     const dist = new Map<string, number>();
     const pathTo = new Map<string, Array<{ node: GraphNode; edge?: GraphEdge }>>();

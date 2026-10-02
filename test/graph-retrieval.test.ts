@@ -339,4 +339,34 @@ describe("GraphRetrieval", () => {
     const results = await retrieval.searchByEntities(["React"]);
     expect(results.map((r) => r.obsId)).toContain("obs_1");
   });
+  it("ignores substring matches against 1-2 char names but keeps exact ones", async () => {
+    const kv = mockKV(
+      [
+        makeNode("n1", "id", "concept", ["obs_short"]),
+        makeNode("n2", "SessionId", "concept", ["obs_long"]),
+      ],
+      [],
+    );
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const substring = await retrieval.searchByEntities(["sessionid"]);
+    expect(substring.map((r) => r.obsId)).toEqual(["obs_long"]);
+
+    const exact = await retrieval.searchByEntities(["id"]);
+    expect(exact.map((r) => r.obsId)).toContain("obs_short");
+  });
+
+  it("caps the number of start nodes, preferring exact and well-connected matches", async () => {
+    const nodes = Array.from({ length: 60 }, (_, i) =>
+      makeNode(`n${i}`, `auth-handler-${i}`, "concept", [`obs_${i}`]),
+    );
+    nodes.push(makeNode("exact", "auth", "concept", ["obs_exact"]));
+    const kv = mockKV(nodes, []);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["auth"], 2, 100);
+
+    expect(results.length).toBe(25);
+    expect(results.map((r) => r.obsId)).toContain("obs_exact");
+  });
 });
