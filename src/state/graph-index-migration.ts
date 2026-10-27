@@ -279,7 +279,8 @@ export class GraphIndexMigrationController {
       job.phase = phase;
       await this.assertActive(state, job);
       await this.save(state, job);
-      const rows = await state.list<{ id?: unknown }>(SCOPES[phase]);
+      // Keys only: full graph scopes exceed the engine's per-message limit. The run phase checks row.id === key.
+      const rows = (await state.listKeys(SCOPES[phase])).map((id) => ({ id }));
       await this.assertActive(state, job);
       let ids: string[] = [];
       const flush = async () => {

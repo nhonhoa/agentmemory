@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { StateKV } from "./kv.js";
-import { KV } from "./schema.js";
+import { GRAPH_RETRIEVAL_DATA_SHARDS, KV } from "./schema.js";
 import { afterKeyedLock } from "./keyed-mutex.js";
 import { initializeGraphIndex } from "./graph-retrieval-index.js";
 
@@ -11,6 +11,7 @@ const GRAPH_SCOPES = new Set<string>([
   KV.graphNodes, KV.graphEdges, KV.graphEdgeHistory, KV.graphSnapshot,
   KV.graphNameIndex, KV.graphEdgeKey, KV.graphNodeDegree, KV.graphMembership,
   KV.graphRetrievalControl, KV.graphRetrievalData, KV.graphIndexMigration, KV.graphIndexManifest,
+  ...GRAPH_RETRIEVAL_DATA_SHARDS,
 ]);
 const pinned = new AsyncLocalStorage<{ kv: StateKV; generation: string | null }>();
 const views = new WeakMap<StateKV, { target: StateKV; id: string | null }>();
@@ -86,7 +87,7 @@ export async function pinGraphState(kv: StateKV): Promise<StateKV> {
 }
 
 function graphView(kv: StateKV, id: string | null): StateKV {
-  const methods = new Set(["get", "set", "update", "delete", "list"]);
+  const methods = new Set(["get", "set", "update", "delete", "list", "listKeys"]);
   const view = new Proxy(kv, {
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver);

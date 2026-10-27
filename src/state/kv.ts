@@ -59,6 +59,14 @@ export function applyUpdateOps(oldValue: unknown, ops: UpdateOp[]): unknown {
   return current
 }
 
+const LIST_FALLBACK_CONCURRENCY = 32
+
+export function isPayloadTooLarge(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const { code, message } = error as { code?: unknown; message?: unknown }
+  return code === 'payload_too_large' || (typeof message === 'string' && message.includes('payload_too_large'))
+}
+
 const MIN_ID_TIME = Date.UTC(2020, 0, 1)
 const MAX_ID_TIME = Date.UTC(2100, 0, 1)
 
@@ -191,11 +199,51 @@ export class StateKV {
   async list<T = unknown>(scope: string): Promise<T[]> {
     scope = await resolveGraphScope(this, scope)
     await ensureGraphConsistency(this, scope)
-    const values = await this.sdk.trigger<{ scope: string }, T[]>({
-      function_id: 'state::list',
-      payload: { scope },
-    })
+    let values: T[]
+    try {
+      values = await this.sdk.trigger<{ scope: string }, T[]>({
+        function_id: 'state::list',
+        payload: { scope },
+      })
+    } catch (error) {
+      if (!isPayloadTooLarge(error)) throw error
+      // The engine caps one message at 16 MiB; large scopes are read key by key instead.
+      values = await this.listByKeys<T>(scope)
+    }
     if (this.backend !== 'redis' || !Array.isArray(values)) return values
     return orderLikeInsertion(values)
+  }
+
+  async listKeys(scope: string): Promise<string[]> {
+    scope = await resolveGraphScope(this, scope)
+    await ensureGraphConsistency(this, scope)
+    return this.rawListKeys(scope)
+  }
+
+  private async rawListKeys(scope: string): Promise<string[]> {
+    const result = await this.sdk.trigger<{ scope: string }, { keys?: unknown } | unknown[]>({
+      function_id: 'state::list_keys',
+      payload: { scope },
+    })
+    const keys = Array.isArray(result) ? result : (result as { keys?: unknown })?.keys
+    if (!Array.isArray(keys)) throw new Error(`state::list_keys returned no keys for ${scope}`)
+    return keys.filter((key): key is string => typeof key === 'string')
+  }
+
+  private async listByKeys<T>(scope: string): Promise<T[]> {
+    const keys = await this.rawListKeys(scope)
+    const values: (T | null)[] = new Array(keys.length)
+    let next = 0
+    const worker = async () => {
+      while (next < keys.length) {
+        const index = next++
+        values[index] = await this.sdk.trigger<{ scope: string; key: string }, T | null>({
+          function_id: 'state::get',
+          payload: { scope, key: keys[index]! },
+        })
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(LIST_FALLBACK_CONCURRENCY, keys.length) }, worker))
+    return values.filter((value): value is T => value !== null && value !== undefined)
   }
 }

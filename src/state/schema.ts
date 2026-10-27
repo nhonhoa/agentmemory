@@ -141,3 +141,10 @@ export function jaccardSimilarity(a: string, b: string): number {
   }
   return intersection / (setA.size + setB.size - intersection);
 }
+
+// iii-state cannot persist a single scope past ~1 GiB, and a full graph index outgrows that.
+export const GRAPH_RETRIEVAL_DATA_SHARD_COUNT = 16;
+export const GRAPH_RETRIEVAL_DATA_SHARDS: readonly string[] = Array.from(
+  { length: GRAPH_RETRIEVAL_DATA_SHARD_COUNT },
+  (_, i) => `${KV.graphRetrievalData}:shard:${i.toString(16)}`,
+);

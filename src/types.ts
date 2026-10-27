@@ -539,7 +539,7 @@ export interface GraphIndexMembership {
 }
 
 export interface GraphRetrievalIndexControl {
-  schema: 2;
+  schema: 3;
   buildId: string;
   status: "building" | "ready" | "paused";
   revision: number;

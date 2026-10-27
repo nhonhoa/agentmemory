@@ -4,7 +4,7 @@ import type { StateKV } from "./kv.js";
 import { getGraphGeneration, pinGraphState, pinGraphStateGeneration } from "./graph-generation.js";
 import { ensureGraphConsistency, noteGraphSnapshotWrite, withoutGraphRecovery } from "./graph-consistency.js";
 import { isKeyedLockHeld, withKeyedLock } from "./keyed-mutex.js";
-import { KV } from "./schema.js";
+import { GRAPH_RETRIEVAL_DATA_SHARDS, GRAPH_RETRIEVAL_DATA_SHARD_COUNT, KV } from "./schema.js";
 
 export const GRAPH_INDEX_MAX_ID_BYTES = 1024;
 export const GRAPH_INDEX_MAX_RECORD_BYTES = 32 * 1024;
@@ -12,6 +12,7 @@ const MAX_CONTROL_BYTES = 8 * 1024;
 const MAX_PROJECTION_BYTES = 16 * 1024;
 const MAX_JOURNAL_BYTES = 8 * 1024 * 1024;
 const MAX_POSTINGS = 192;
+const JOURNAL_APPLY_CONCURRENCY = 64;
 const CONTROL_KEY = "current";
 export type GraphIndexRecordKind = "node" | "edge" | "history";
 export type GraphPostingKind = "name" | "character" | "observation" | "edgeObservation" | "edgeKey" | "adjacency" | "history" | "nodes" | "edges" | "historyEdges";
@@ -42,10 +43,12 @@ const token = (kind: GraphPostingKind, value: string) => hash(`${kind}\0${kind =
 const recordKey = (buildId: string, kind: GraphIndexRecordKind, id: string) => `${buildId}:record:${kind}:${hash(id)}`;
 const rootKey = (buildId: string, posting: string) => `${buildId}:root:${posting}`;
 const entryKey = (buildId: string, posting: string, id: string) => `${buildId}:entry:${posting}:${id}`;
+export const retrievalDataScope = (key: string): string =>
+  GRAPH_RETRIEVAL_DATA_SHARDS[createHash("sha256").update(key).digest()[0]! % GRAPH_RETRIEVAL_DATA_SHARD_COUNT]!;
 const countKey = (kind: GraphIndexRecordKind) => kind === "node" ? "nodes" : kind === "edge" ? "edges" : "historyEdges";
 
 function validateControl(value: GraphRetrievalIndexControl): void {
-  if (bytes(value) > MAX_CONTROL_BYTES || value.schema !== 2 || typeof value.buildId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.buildId) ||
+  if (bytes(value) > MAX_CONTROL_BYTES || value.schema !== 3 || typeof value.buildId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.buildId) ||
       !["building", "ready", "paused"].includes(value.status) ||
       ![value.revision, value.nodes, value.edges, value.historyEdges, value.incompleteRecords, value.otherTypes].every(finiteCount) ||
       !value.nodesByType || !value.edgesByType ||
@@ -57,8 +60,12 @@ function validateControl(value: GraphRetrievalIndexControl): void {
   }
 }
 
+type LegacyIndexControl = { schema: 2 };
+
 export async function getGraphIndexStatus(state: StateKV): Promise<GraphRetrievalIndexControl | null> {
-  const value = await state.get<GraphRetrievalIndexControl>(KV.graphRetrievalControl, CONTROL_KEY);
+  const value = await state.get<GraphRetrievalIndexControl | LegacyIndexControl>(KV.graphRetrievalControl, CONTROL_KEY);
+  // Schema 2 kept all index data in one scope that iii-state cannot persist past ~1 GiB; such an index needs a new build.
+  if (value?.schema === 2) return null;
   if (value !== null && value !== undefined) validateControl(value);
   return value ?? null;
 }
@@ -66,7 +73,7 @@ export async function getGraphIndexStatus(state: StateKV): Promise<GraphRetrieva
 export async function initializeGraphIndex(state: StateKV, options: { status: "building" | "ready"; buildId?: string }): Promise<GraphRetrievalIndexControl> {
   const kv = await pinGraphState(state);
   return lock(kv, async () => {
-    const value: GraphRetrievalIndexControl = { schema: 2, buildId: options.buildId ?? randomUUID(), status: options.status,
+    const value: GraphRetrievalIndexControl = { schema: 3, buildId: options.buildId ?? randomUUID(), status: options.status,
       revision: 0, nodes: 0, edges: 0, historyEdges: 0, incompleteRecords: 0, nodesByType: {}, edgesByType: {}, otherTypes: 0, updatedAt: new Date().toISOString() };
     validateControl(value);
     const previous = await kv.get<GraphRetrievalIndexControl>(KV.graphRetrievalControl, CONTROL_KEY);
@@ -172,7 +179,7 @@ function validateRecord(value: GraphRetrievalIndexRecord): void {
 
 async function planRecord(kv: StateKV, control: GraphRetrievalIndexControl, kind: GraphIndexRecordKind, id: string, input: unknown): Promise<IndexJournal> {
   const writes = new Map<string, unknown>();
-  const read = async <T>(key: string): Promise<T | null> => writes.has(key) ? writes.get(key) as T | null : kv.get<T>(KV.graphRetrievalData, key);
+  const read = async <T>(key: string): Promise<T | null> => writes.has(key) ? writes.get(key) as T | null : kv.get<T>(retrievalDataScope(key), key);
   const put = (key: string, value: unknown) => { if (bytes(value) > GRAPH_INDEX_MAX_RECORD_BYTES) throw new GraphIndexError("Graph retrieval index write exceeds record budget"); writes.set(key, value); };
   const key = recordKey(control.buildId, kind, id);
   const before = await read<GraphRetrievalIndexRecord>(key);
@@ -214,8 +221,9 @@ async function planRecord(kv: StateKV, control: GraphRetrievalIndexControl, kind
     }
   };
   const oldPostings = new Set(before?.postings ?? []), newPostings = new Set(after?.postings ?? []);
-  for (const posting of oldPostings) if (!newPostings.has(posting)) await editPosting(posting, false);
-  for (const posting of newPostings) if (!oldPostings.has(posting)) await editPosting(posting, true);
+  // Every key editPosting touches embeds its posting, so distinct postings never share pending writes.
+  await Promise.all([...oldPostings].filter((posting) => !newPostings.has(posting)).map((posting) => editPosting(posting, false)));
+  await Promise.all([...newPostings].filter((posting) => !oldPostings.has(posting)).map((posting) => editPosting(posting, true)));
   put(key, after);
   const { pending: _, ...clean } = control;
   const next = { ...clean, revision: control.revision + 1, updatedAt: new Date().toISOString() };
@@ -250,9 +258,11 @@ async function applyJournal(kv: StateKV, control: GraphRetrievalIndexControl, jo
       throw new GraphIndexError("Invalid graph retrieval recovery write");
     }
   }
-  for (const write of journal.writes) {
-    if (write.value === null) await kv.delete(KV.graphRetrievalData, write.key);
-    else await kv.set(KV.graphRetrievalData, write.key, write.value);
+  // The journal is persisted before it is applied, so a partial parallel apply is replayed on recovery.
+  for (let i = 0; i < journal.writes.length; i += JOURNAL_APPLY_CONCURRENCY) {
+    await Promise.all(journal.writes.slice(i, i + JOURNAL_APPLY_CONCURRENCY).map((write) => write.value === null
+      ? kv.delete(retrievalDataScope(write.key), write.key)
+      : kv.set(retrievalDataScope(write.key), write.key, write.value)));
   }
   await kv.set(KV.graphRetrievalControl, CONTROL_KEY, journal.next);
 }
@@ -429,7 +439,7 @@ export class GraphIndexReader {
     else this.active++;
     try {
       if (this.options.signal?.aborted || this.exhausted) { this.exhausted = true; return null; }
-      const value = await this.state.get<T>(scope, key);
+      const value = await this.state.get<T>(scope === KV.graphRetrievalData ? retrievalDataScope(key) : scope, key);
       const size = bytes(value);
       this.readBytes += size;
       if (this.readBytes > this.maxBytes || this.options.signal?.aborted) { this.exhausted = true; return null; }

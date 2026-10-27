@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { StateKV, applyUpdateOps, type StateBackend } from "../src/state/kv.js";
 import { KV } from "../src/state/schema.js";
 import { pinGraphState, resetGraphGeneration, setGraphGenerationListener } from "../src/state/graph-generation.js";
-import { createGraphIndexReader, finishGraphIndexBuild, getGraphIndexStatus, initializeGraphIndex, reconcileGraphIndexRecord, recoverGraphIndex } from "../src/state/graph-retrieval-index.js";
+import { createGraphIndexReader, finishGraphIndexBuild, getGraphIndexStatus, initializeGraphIndex, reconcileGraphIndexRecord, recoverGraphIndex, retrievalDataScope } from "../src/state/graph-retrieval-index.js";
 import { withKeyedLock } from "../src/state/keyed-mutex.js";
 import type { GraphNode } from "../src/types.js";
 
@@ -89,7 +89,7 @@ describe("bounded graph retrieval index", () => {
     const f = fixture(); await initializeGraphIndex(f.kv, { status: "ready" });
     await f.kv.set(KV.graphNodes, "a", node("a", "same"));
     let writes = 0;
-    f.fail((c, done) => { if (done && c.function_id === "state::set" && c.payload.scope === KV.graphRetrievalData && ++writes === 4) throw new Error("lost ack"); });
+    f.fail((c, done) => { if (done && c.function_id === "state::set" && c.payload.scope.startsWith(KV.graphRetrievalData) && ++writes === 4) throw new Error("lost ack"); });
     await expect(f.kv.set(KV.graphNodes, "b", node("b", "same"))).rejects.toThrow("lost ack");
     f.fail(); await recoverGraphIndex(new StateKV(f.sdk as never));
     const reader = (await createGraphIndexReader(f.kv))!;
@@ -127,7 +127,7 @@ describe("bounded graph retrieval index", () => {
     expect(reader.status.incompleteRecords).toBe(1);
     for (let i = 0; i < 20; i++) await reader.getNode(`absent-${i}`);
     expect(reader.exhausted).toBe(true);
-    expect(calls.filter((c) => c.payload.scope === KV.graphRetrievalData)).toHaveLength(4);
+    expect(calls.filter((c) => c.payload.scope.startsWith(KV.graphRetrievalData))).toHaveLength(4);
     expect(await reader.finish()).toBe(true);
     expect(calls).toHaveLength(8);
     expect(calls.every((c) => c.function_id === "state::get" && ![KV.graphNodes, KV.graphEdges, KV.graphSnapshot].includes(c.payload.scope))).toBe(true);
@@ -214,7 +214,8 @@ describe("bounded graph retrieval index", () => {
     if (kind === "nodes") await kv.set(KV.graphNodes, "a", node("a"));
     else await kv.set(kind === "edges" ? KV.graphEdges : KV.graphEdgeHistory, edge.id, edge);
     const posting = createHash("sha256").update(JSON.stringify(`${kind}\0`)).digest("hex");
-    const key = `${KV.graphRetrievalData}\0${control.buildId}:root:${posting}`;
+    const rootKey = `${control.buildId}:root:${posting}`;
+    const key = `${retrievalDataScope(rootKey)}\0${rootKey}`;
     const root = data.get(key) as { head: string; count: number };
     expect(root.count).toBe(1);
     data.delete(key);
@@ -271,7 +272,7 @@ describe("bounded graph retrieval index", () => {
       sourceObservationIds: Array.from({ length: 128 }, (_, i) => `${i}-${"a".repeat(1000)}`), properties: { value: "p".repeat(500) } };
     await kv.set(KV.graphNodes, source.id, source);
     expect(await kv.get(KV.graphNodes, source.id)).toEqual(source);
-    for (const [key, value] of data) if (key.startsWith(`${KV.graphRetrievalData}\0`)) expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThanOrEqual(32768);
+    for (const [key, value] of data) if (key.startsWith(`${KV.graphRetrievalData}:shard:`)) expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThanOrEqual(32768);
     const reader = (await createGraphIndexReader(kv))!;
     expect(await reader.getNode(source.id)).toMatchObject({ indexIncomplete: true });
     expect(await reader.finish()).toBe(true);
